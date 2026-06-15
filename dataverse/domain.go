@@ -2,15 +2,14 @@ package dataverse
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes dataverse as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes the Harvard Dataverse as a kit Domain: a driver that a
+// multi-domain host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/dataverse-cli/dataverse"
 //
@@ -19,9 +18,6 @@ import (
 // dataverse:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone dataverse binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the dataverse driver. It carries no state; the per-run client is
@@ -36,36 +32,29 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "dataverse",
-			Short:  "A command line for dataverse.",
-			Long: `A command line for dataverse.
+			Short:  "A command line for Harvard Dataverse.",
+			Long: `A command line for Harvard Dataverse.
 
-dataverse reads public dataverse data over plain HTTPS, shapes it into
+dataverse reads public Harvard Dataverse data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+key, nothing to run alongside it. Harvard Dataverse hosts 300k+ datasets across
+every research domain.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/dataverse-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `dataverse page` and
-	// `ant get dataverse://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search Harvard Dataverse datasets",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, searchDatasets)
 
-	// List op: members of a page, the home of `dataverse links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// dataverse://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "recent", Group: "read", List: true,
+		Summary: "List recently published datasets"}, recentDatasets)
 }
 
 // newClient builds the client from the host-resolved config, so a host and the
@@ -73,55 +62,64 @@ func (Domain) Register(app *kit.App) {
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"          help:"search query"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Offset int     `kit:"flag"         help:"result offset"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type recentInput struct {
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchDatasets(ctx context.Context, in searchInput, emit func(*Dataset) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	datasets, _, err := in.Client.SearchDatasets(ctx, in.Query, limit, in.Offset)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	for _, d := range datasets {
+		if err := emit(d); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func recentDatasets(ctx context.Context, in recentInput, emit func(*Dataset) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	datasets, _, err := in.Client.RecentDatasets(ctx, limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, d := range datasets {
+		if err := emit(d); err != nil {
 			return err
 		}
 	}
@@ -130,44 +128,31 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full dataverse.com URL —
+// Classify turns any accepted input — a bare DOI or a full Dataverse URL —
 // into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized dataverse reference: %q", input)
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", "", errs.Usage("dataverse reference required")
 	}
-	return "page", id, nil
+	return "dataset", trimDOI(s), nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "dataset":
+		if strings.HasPrefix(id, "doi:") {
+			return "https://doi.org/" + strings.TrimPrefix(id, "doi:"), nil
+		}
+		return "https://dataverse.harvard.edu/dataset.xhtml?persistentId=" + id, nil
+	default:
 		return "", errs.Usage("dataverse has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
