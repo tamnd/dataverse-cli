@@ -1,70 +1,90 @@
 // Package dataverse is the library behind the dataverse command line:
-// the HTTP client, request shaping, and the typed data models for dataverse.
+// the HTTP client, request shaping, and the typed data models for the
+// Harvard Dataverse repository.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
+// transient failures (429 and 5xx) that any public API throws under load.
 // Build your endpoint calls and JSON decoding on top of it.
 package dataverse
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to dataverse. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "dataverse/dev (+https://github.com/tamnd/dataverse-cli)"
-
 // Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at dataverse.com; change it once you
-// know the real endpoints you want to read.
-const Host = "dataverse.com"
+// domain.go claims.
+const Host = "dataverse.harvard.edu"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// baseURL is the search endpoint every request is built from.
+const baseURL = "https://dataverse.harvard.edu/api/search"
 
-// Client talks to dataverse over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// DefaultUserAgent identifies the client to Dataverse. A real, honest
+// User-Agent is both polite and the thing most likely to keep you unblocked.
+const DefaultUserAgent = "dataverse-cli/0.1.0 (+https://github.com/tamnd/dataverse-cli)"
+
+// Config holds the tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults: a 500 ms pace, three retries, and a
+// 30 s timeout.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the Harvard Dataverse search API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client built from DefaultConfig.
+func NewClient() *Client {
+	return NewClientWithConfig(DefaultConfig())
+}
+
+// NewClientWithConfig returns a Client built from cfg.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings. The caller owns nothing extra; the body
+// is read fully and closed here.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(c.backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +93,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,16 +127,17 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
+// backoff returns the delay before a given retry attempt.
+func (c *Client) backoff(attempt int) time.Duration {
 	d := time.Duration(attempt) * 500 * time.Millisecond
 	if d > 5*time.Second {
 		d = 5 * time.Second
@@ -123,78 +145,161 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on dataverse.com. It is a stand-in for the typed records you
-// will model from the real dataverse endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `dataverse cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types — match the Dataverse search JSON shape exactly ---
+
+type wireItem struct {
+	Name        string          `json:"name"`
+	Type        string          `json:"type"`
+	URL         string          `json:"url"`
+	GlobalID    string          `json:"global_id"`
+	Description string          `json:"description"`
+	PublishedAt string          `json:"published_at"`
+	Publisher   string          `json:"publisher"`
+	Subjects    []string        `json:"subjects"`
+	FileCount   int             `json:"fileCount"`
+	CreatedAt   string          `json:"createdAt"`
+	UpdatedAt   string          `json:"updatedAt"`
+	Authors     json.RawMessage `json:"authors"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type wireData struct {
+	TotalCount int        `json:"total_count"`
+	Start      int        `json:"start"`
+	PerPage    int        `json:"per_page"`
+	Items      []wireItem `json:"items"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type wireResp struct {
+	Status string   `json:"status"`
+	Data   wireData `json:"data"`
+}
+
+// Dataset is the public record type: one dataset entry from Harvard Dataverse.
+type Dataset struct {
+	ID          string   `json:"id"                   kit:"id"`
+	Title       string   `json:"title"`
+	URL         string   `json:"url,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Publisher   string   `json:"publisher,omitempty"`
+	Subjects    []string `json:"subjects,omitempty"`
+	Authors     []string `json:"authors,omitempty"`
+	FileCount   int      `json:"file_count,omitempty"`
+	PublishedAt string   `json:"published_at,omitempty"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
+}
+
+// datasetFromWire converts a wire item into the public Dataset type.
+func datasetFromWire(item wireItem) *Dataset {
+	return &Dataset{
+		ID:          item.GlobalID,
+		Title:       item.Name,
+		URL:         item.URL,
+		Description: item.Description,
+		Publisher:   item.Publisher,
+		Subjects:    item.Subjects,
+		Authors:     parseAuthors(item.Authors),
+		FileCount:   item.FileCount,
+		PublishedAt: item.PublishedAt,
+		UpdatedAt:   item.UpdatedAt,
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+}
+
+// parseAuthors handles the authors field: the Dataverse API returns []string.
+// Use json.RawMessage to be robust against shape changes.
+func parseAuthors(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Try []string first (the common case).
+	var ss []string
+	if err := json.Unmarshal(raw, &ss); err == nil {
+		return dedup(ss)
+	}
+	// Fall back to []map[string]interface{} and extract "name".
+	var ms []map[string]interface{}
+	if err := json.Unmarshal(raw, &ms); err == nil {
+		out := make([]string, 0, len(ms))
+		for _, m := range ms {
+			if n, ok := m["name"].(string); ok && n != "" {
+				out = append(out, n)
+			}
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		return out
 	}
-	return out, nil
+	return nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// dedup removes consecutive duplicate strings (the API sometimes repeats authors).
+func dedup(ss []string) []string {
+	if len(ss) == 0 {
+		return ss
+	}
+	out := make([]string, 0, len(ss))
+	seen := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
 		}
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// buildURL constructs the search API URL from the given parameters.
+func (c *Client) buildURL(query string, limit, offset int) string {
+	q := url.QueryEscape(query)
+	return fmt.Sprintf("%s?q=%s&type=dataset&per_page=%d&start=%d&sort=date&order=desc",
+		c.cfg.BaseURL, q, limit, offset)
+}
+
+// SearchDatasets queries the Dataverse search API and returns matching datasets
+// plus the total count.
+func (c *Client) SearchDatasets(ctx context.Context, query string, limit, offset int) ([]*Dataset, int, error) {
+	if limit <= 0 {
+		limit = 20
 	}
-	return s
+	rawURL := c.buildURL(query, limit, offset)
+	body, err := c.Get(ctx, rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseSearchResp(body)
+}
+
+// RecentDatasets returns the most recently published datasets by searching
+// for all records ordered by date.
+func (c *Client) RecentDatasets(ctx context.Context, limit int) ([]*Dataset, int, error) {
+	return c.SearchDatasets(ctx, "*", limit, 0)
+}
+
+// parseSearchResp decodes a raw Dataverse search JSON response.
+func parseSearchResp(body []byte) ([]*Dataset, int, error) {
+	var resp wireResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode search response: %w", err)
+	}
+	if resp.Status != "OK" {
+		return nil, 0, fmt.Errorf("dataverse status %q", resp.Status)
+	}
+	out := make([]*Dataset, 0, len(resp.Data.Items))
+	for _, item := range resp.Data.Items {
+		// Skip non-dataset items in mixed results.
+		if item.Type != "" && item.Type != "dataset" {
+			continue
+		}
+		out = append(out, datasetFromWire(item))
+	}
+	return out, resp.Data.TotalCount, nil
+}
+
+// trimDOI returns input with common DOI URL prefixes removed, leaving a bare
+// "doi:…" identifier.
+func trimDOI(input string) string {
+	input = strings.TrimSpace(input)
+	for _, pfx := range []string{"https://doi.org/", "http://doi.org/", "doi.org/"} {
+		if strings.HasPrefix(input, pfx) {
+			return "doi:" + strings.TrimPrefix(input, pfx)
+		}
+	}
+	return input
 }
